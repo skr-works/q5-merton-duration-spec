@@ -148,22 +148,6 @@ def fetch_sheet_rows(service, spreadsheet_id: str, worksheet_name: str) -> List[
     return resp.get("values", [])
 
 
-def ensure_headers(service, spreadsheet_id: str, worksheet_name: str):
-    header = INPUT_COLS + OUTPUT_HEADERS
-    body = {"values": [header]}
-    with_retry(
-        lambda: service.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{worksheet_name}!A1:AD1",
-            valueInputOption="RAW",
-            body=body,
-        ).execute(),
-        retries=2,
-        retryable=(HttpError,),
-        label="sheet_header_update",
-    )
-
-
 def batch_write_rows(service, spreadsheet_id: str, worksheet_name: str, rows: List[List[Any]]):
     body = {"values": rows}
     with_retry(
@@ -486,7 +470,6 @@ def main() -> None:
     cfg = parse_secret()
     service = get_sheets_service(cfg.credentials_info)
     spreadsheet_id = spreadsheet_id_from_url(cfg.spreadsheet_url)
-    ensure_headers(service, spreadsheet_id, cfg.worksheet_name)
     rows_raw = fetch_sheet_rows(service, spreadsheet_id, cfg.worksheet_name)
 
     if not rows_raw:
