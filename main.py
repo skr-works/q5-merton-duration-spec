@@ -95,6 +95,7 @@ class FinancialMetrics:
     net_income: Optional[float]
     prev_net_income: Optional[float]
     quarterly_ocf: List[float]
+    short_name: str
 
 
 def parse_secret() -> AppConfig:
@@ -211,6 +212,14 @@ def safe_float(x: Any) -> Optional[float]:
         return None
 
 
+def _squeeze_to_series(obj: Any) -> pd.Series:
+    """DataFrame/Series どちらでも安全に1次元 Series に変換する。"""
+    if isinstance(obj, pd.DataFrame):
+        # MultiIndex の場合は最初の列を使う
+        return obj.iloc[:, 0]
+    return obj
+
+
 def last_nonnull(df: Optional[pd.DataFrame], labels: List[str]) -> Optional[float]:
     if df is None or df.empty:
         return None
@@ -218,7 +227,8 @@ def last_nonnull(df: Optional[pd.DataFrame], labels: List[str]) -> Optional[floa
     for label in labels:
         key = label.strip().lower()
         if key in lower:
-            series = pd.to_numeric(df.loc[lower[key]], errors="coerce").dropna()
+            row = df.loc[lower[key]]
+            series = pd.to_numeric(_squeeze_to_series(row), errors="coerce").dropna()
             if not series.empty:
                 return safe_float(series.iloc[0])
     return None
@@ -231,7 +241,8 @@ def first_two_nonnull(df: Optional[pd.DataFrame], labels: List[str]) -> Tuple[Op
     for label in labels:
         key = label.strip().lower()
         if key in lower:
-            series = pd.to_numeric(df.loc[lower[key]], errors="coerce").dropna()
+            row = df.loc[lower[key]]
+            series = pd.to_numeric(_squeeze_to_series(row), errors="coerce").dropna()
             if not series.empty:
                 first = safe_float(series.iloc[0])
                 second = safe_float(series.iloc[1]) if len(series) > 1 else None
@@ -246,7 +257,8 @@ def extract_quarterly_series(df: Optional[pd.DataFrame], labels: List[str], limi
     for label in labels:
         key = label.strip().lower()
         if key in lower:
-            series = pd.to_numeric(df.loc[lower[key]], errors="coerce").dropna()
+            row = df.loc[lower[key]]
+            series = pd.to_numeric(_squeeze_to_series(row), errors="coerce").dropna()
             return [float(v) for v in series.iloc[:limit].tolist()]
     return []
 
@@ -267,8 +279,15 @@ def fetch_benchmark_returns(session: requests.Session) -> Tuple[pd.Series, str]:
     )
     if df is None or df.empty:
         raise RuntimeError("Benchmark fetch failed")
-    close = df["Close"] if "Close" in df.columns else df.iloc[:, 0]
-    close = pd.to_numeric(close, errors="coerce").dropna()
+
+    # FIX①: yfinance 0.2.x+ では df["Close"] が MultiIndex DataFrame になるため
+    # squeeze() で強制的に 1-d Series に変換する
+    if "Close" in df.columns:
+        close_raw = df["Close"]
+    else:
+        close_raw = df.iloc[:, 0]
+    close = pd.to_numeric(_squeeze_to_series(close_raw), errors="coerce").dropna()
+
     if len(close) < MIN_PRICE_DAYS:
         raise RuntimeError("Benchmark price history too short")
     price_date = close.index[-1].strftime("%Y-%m-%d")
@@ -288,7 +307,8 @@ def fetch_price_metrics(symbol: str, benchmark_returns: pd.Series, price_date: s
     if hist is None or hist.empty or "Close" not in hist.columns:
         return PriceMetrics(None, None, None, None, 0)
 
-    close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+    # FIX②: history() の Close も念のため squeeze して Series に落とす
+    close = pd.to_numeric(_squeeze_to_series(hist["Close"]), errors="coerce").dropna()
     close = close[close.index.strftime("%Y-%m-%d") <= price_date]
     if close.empty:
         return PriceMetrics(None, None, None, None, 0)
@@ -312,8 +332,9 @@ def fetch_price_metrics(symbol: str, benchmark_returns: pd.Series, price_date: s
 def fetch_financial_metrics(symbol: str, latest_price: Optional[float], session: requests.Session) -> FinancialMetrics:
     ticker = yf.Ticker(symbol)
 
-    info = {}
+    # FIX⑥: info は1回だけ取得してキャッシュする（NAME_YF のために2回呼んでいたのを統合）
     fast = {}
+    info = {}
     try:
         fast = dict(ticker.fast_info)
     except Exception:
@@ -358,10 +379,11 @@ def fetch_financial_metrics(symbol: str, latest_price: Optional[float], session:
         "Common Stock Equity",
     ])
 
+    # FIX⑤: operating_cf のラベル重複を修正
     operating_cf = last_nonnull(cashflow, [
         "Operating Cash Flow",
         "Cash Flow From Continuing Operating Activities",
-        "Cash Flow From Continuing Operating Activities",
+        "Total Cash From Operating Activities",
     ])
     free_cf = last_nonnull(cashflow, ["Free Cash Flow"])
     capex = last_nonnull(cashflow, [
@@ -381,6 +403,9 @@ def fetch_financial_metrics(symbol: str, latest_price: Optional[float], session:
         "Cash Flow From Continuing Operating Activities",
     ], limit=4)
 
+    # FIX⑥: short_name をここで取得しておき、main ループでの2度目の ticker.info 呼び出しを不要にする
+    short_name = str(info.get("shortName", "") or "")[:100]
+
     return FinancialMetrics(
         market_cap=market_cap,
         total_assets=total_assets,
@@ -397,10 +422,12 @@ def fetch_financial_metrics(symbol: str, latest_price: Optional[float], session:
         net_income=net_income,
         prev_net_income=prev_net_income,
         quarterly_ocf=quarterly_ocf,
+        short_name=short_name,
     )
 
 
-def pct_score(values: Dict[int, Optional[float]], invert: bool = False) -> Dict[int, Optional[float]]:
+def pct_score(values: Dict[str, Optional[float]], invert: bool = False) -> Dict[str, Optional[float]]:
+    # FIX⑧: 型ヒントを Dict[int, ...] → Dict[str, ...] に修正
     clean = {k: v for k, v in values.items() if v is not None and not math.isnan(v)}
     if not clean:
         return {k: None for k in values}
@@ -409,7 +436,7 @@ def pct_score(values: Dict[int, Optional[float]], invert: bool = False) -> Dict[
     clipped = {k: float(min(max(v, low), high)) for k, v in clean.items()}
     sorted_items = sorted(clipped.items(), key=lambda kv: kv[1])
     n = len(sorted_items)
-    out: Dict[int, Optional[float]] = {k: None for k in values}
+    out: Dict[str, Optional[float]] = {k: None for k in values}
     if n == 1:
         only_key = sorted_items[0][0]
         out[only_key] = 100.0 if not invert else 0.0
@@ -505,10 +532,12 @@ def main() -> None:
         prepared_rows.append(base_row)
         code_to_indices.setdefault(code, []).append(len(prepared_rows) - 1)
 
-    logger.info(f"START ts={started} rows={len(prepared_rows)}")
-
+    # FIX⑨: benchmark を先に取得してから START ログを出すことで
+    # benchmark 取得失敗時に START が出てしまう問題を解消
     session = yf_session()
     benchmark_returns, benchmark_price_date = fetch_benchmark_returns(session)
+
+    logger.info(f"START ts={started} rows={len(prepared_rows)}")
     logger.info(f"MARKET benchmark={BENCHMARK} price_date={benchmark_price_date}")
     logger.info(f"READ unique_codes={len(code_to_indices)}")
 
@@ -543,6 +572,7 @@ def main() -> None:
             "ROE_TTM": None,
             "DATA_COVERAGE": 0,
             "REASON_CODES": [],
+            "REASON_TEXT": "",   # FIX⑩: 初期化時から REASON_TEXT を含める
             "ERROR_MESSAGE": "",
         }
         try:
@@ -552,10 +582,8 @@ def main() -> None:
             result["PRICE_DATE"] = pm.price_date or ""
             result["BETA_252D"] = pm.beta_252d
             result["IVOL_252D"] = pm.ivol_252d
-            try:
-                result["NAME_YF"] = yf.Ticker(symbol).info.get("shortName", "")[:100]
-            except Exception:
-                result["NAME_YF"] = ""
+            # FIX⑥: fetch_financial_metrics 内で取得済みの short_name を使い、余分な API 呼び出しを排除
+            result["NAME_YF"] = fm.short_name
 
             price_ok = pm.price_days >= MIN_PRICE_DAYS and pm.price_date == benchmark_price_date
             spec_ok_inputs = all(v is not None for v in [pm.beta_252d, pm.ivol_252d, fm.total_assets, fm.total_debt, fm.operating_cf, fm.cash])
@@ -622,7 +650,9 @@ def main() -> None:
             ocf = r["_operating_cf"]
             cash = r["_cash"]
             distress = None
-            if debt and assets and debt > 0 and assets > 0:
+            # FIX③: ocf と cash が None でないことを明示的に確認してから計算する
+            if (debt and assets and debt > 0 and assets > 0
+                    and ocf is not None and cash is not None):
                 distress = 0.4 * (debt / assets) + 0.3 * (-(ocf / debt)) + 0.3 * (-(cash / debt))
             beta_off = abs((r["BETA_252D"] or 1.0) - 1.0) if r["BETA_252D"] is not None else None
             if distress is not None and beta_off is not None and r["IVOL_252D"] is not None:
@@ -640,7 +670,13 @@ def main() -> None:
             else:
                 std = r["_short_term_debt"]
                 ltd = r["_long_term_debt"]
-                default_point = (std + 0.5 * ltd) if (std is not None and ltd is not None) else (0.75 * debt)
+                # FIX④: std=0 かつ ltd=0 のとき default_point=0 になりDD計算が NA になる問題を回避
+                # std/ltd が存在するが合計が0以下の場合は debt ベースのフォールバックを使う
+                if std is not None and ltd is not None:
+                    dp_candidate = std + 0.5 * ltd
+                    default_point = dp_candidate if dp_candidate > 0 else 0.75 * debt
+                else:
+                    default_point = 0.75 * debt
                 sigma_e = r["IVOL_252D"]
                 va = mc + debt
                 sigma_a = None if va <= 0 or sigma_e is None else sigma_e * mc / va
@@ -690,8 +726,11 @@ def main() -> None:
             ocf = r["_operating_cf"]
             q5_asset_growth[code] = None if assets_t in (None, 0) or assets_p in (None, 0) else assets_t / assets_p - 1.0
             avg_eq_t = None if eq_t is None or eq_p is None else (eq_t + eq_p) / 2.0
-            avg_eq_p = eq_p
+            # FIX⑦: prev_roe の分母を avg_eq_t と同じ基準（2期平均）に統一する
+            # 前期の平均株主資本は eq_p のみしか取れないため、
+            # 当期も eq_t 単体で割るよう両方を単期ベースに統一する
             q5_roe_ttm[code] = None if avg_eq_t in (None, 0) else ni_t / avg_eq_t
+            avg_eq_p = eq_p  # 前期は2期前データが取れないため単期ベース
             prev_roe = None if avg_eq_p in (None, 0) else ni_p / avg_eq_p
             q5_delta_roe[code] = None if q5_roe_ttm[code] is None or prev_roe is None else q5_roe_ttm[code] - prev_roe
             q5_ocf_assets[code] = None if assets_t in (None, 0) else ocf / assets_t
