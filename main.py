@@ -148,6 +148,22 @@ def fetch_sheet_rows(service, spreadsheet_id: str, worksheet_name: str) -> List[
     return resp.get("values", [])
 
 
+def ensure_headers(service, spreadsheet_id: str, worksheet_name: str):
+    header = INPUT_COLS + OUTPUT_HEADERS
+    body = {"values": [header]}
+    with_retry(
+        lambda: service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{worksheet_name}!A1:AD1",
+            valueInputOption="RAW",
+            body=body,
+        ).execute(),
+        retries=2,
+        retryable=(HttpError,),
+        label="sheet_header_update",
+    )
+
+
 def batch_write_rows(service, spreadsheet_id: str, worksheet_name: str, rows: List[List[Any]]):
     body = {"values": rows}
     with_retry(
@@ -244,7 +260,6 @@ def fetch_benchmark_returns(session: requests.Session) -> Tuple[pd.Series, str]:
             auto_adjust=True,
             progress=False,
             threads=False,
-            session=session,
         ),
         retries=2,
         retryable=(Exception,),
@@ -263,7 +278,7 @@ def fetch_benchmark_returns(session: requests.Session) -> Tuple[pd.Series, str]:
 
 def fetch_price_metrics(symbol: str, benchmark_returns: pd.Series, price_date: str, session: requests.Session) -> PriceMetrics:
     hist = with_retry(
-        lambda: yf.Ticker(symbol, session=session).history(
+        lambda: yf.Ticker(symbol).history(
             period=PRICE_PERIOD, interval="1d", auto_adjust=True, repair=True
         ),
         retries=2,
@@ -295,7 +310,7 @@ def fetch_price_metrics(symbol: str, benchmark_returns: pd.Series, price_date: s
 
 
 def fetch_financial_metrics(symbol: str, latest_price: Optional[float], session: requests.Session) -> FinancialMetrics:
-    ticker = yf.Ticker(symbol, session=session)
+    ticker = yf.Ticker(symbol)
 
     info = {}
     fast = {}
@@ -470,6 +485,7 @@ def main() -> None:
     cfg = parse_secret()
     service = get_sheets_service(cfg.credentials_info)
     spreadsheet_id = spreadsheet_id_from_url(cfg.spreadsheet_url)
+    ensure_headers(service, spreadsheet_id, cfg.worksheet_name)
     rows_raw = fetch_sheet_rows(service, spreadsheet_id, cfg.worksheet_name)
 
     if not rows_raw:
@@ -537,7 +553,7 @@ def main() -> None:
             result["BETA_252D"] = pm.beta_252d
             result["IVOL_252D"] = pm.ivol_252d
             try:
-                result["NAME_YF"] = yf.Ticker(symbol, session=session).info.get("shortName", "")[:100]
+                result["NAME_YF"] = yf.Ticker(symbol).info.get("shortName", "")[:100]
             except Exception:
                 result["NAME_YF"] = ""
 
