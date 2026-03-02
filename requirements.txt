@@ -1,0 +1,6 @@
+yfinance
+pandas
+numpy
+google-api-python-client
+google-auth
+requests
