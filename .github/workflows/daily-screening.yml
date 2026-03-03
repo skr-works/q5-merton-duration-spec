@@ -2,7 +2,7 @@ name: daily-screening
 
 on:
   schedule:
-    - cron: "32 10 * * 1-5"
+    - cron: "15 8 * * *"
   workflow_dispatch:
 
 jobs:
