@@ -169,6 +169,7 @@ def fetch_sheet_rows(service, spreadsheet_id: str, worksheet_name: str) -> List[
         resp = with_retry(
             lambda: service.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id, range=range_name
+                valueRenderOption="UNFORMATTED_VALUE"  # ← この1行を追加
             ).execute(),
             retries=2,
             retryable=(HttpError, OSError),
