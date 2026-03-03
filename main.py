@@ -1,8 +1,10 @@
 import os
 import json
 import math
+import random
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -24,7 +26,25 @@ RISK_FREE_RATE = 0.005
 TRADING_DAYS = 252
 MIN_PRICE_DAYS = 180
 PRICE_PERIOD = "400d"
-USER_AGENT = "Mozilla/5.0 (compatible; screening-bot/1.0)"
+USER_AGENTS = [
+    # Chrome / Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # Chrome / macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    # Firefox / Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    # Firefox / macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:125.0) Gecko/20100101 Firefox/125.0",
+    # Safari / macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    # Safari / iPhone (iOS 17)
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
+    # Edge / Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+]
+FETCH_WORKERS = 15       # 並列スレッド数（レート制限に応じて調整）
+CHECKPOINT_EVERY = 75    # 何件ごとに途中書き込みするか
+PRICE_BATCH_SIZE = 200   # yf.download 一括取得の銘柄数上限
 
 # 出力列定義（D列以降、固定）
 OUTPUT_HEADERS = [
@@ -153,11 +173,11 @@ def fetch_sheet_rows(service, spreadsheet_id: str, worksheet_name: str) -> List[
                 spreadsheetId=spreadsheet_id, range=range_name
             ).execute(),
             retries=2,
-            retryable=(HttpError,),
+            retryable=(HttpError, OSError),
             label="sheet_read",
         )
         return resp.get("values", [])
-    except HttpError:
+    except (HttpError, OSError):
         logger.info("FATAL stage=sheet_read error=SHEET_READ_FAILED")
         raise
 
@@ -188,10 +208,10 @@ def batch_write_output(
                 spreadsheetId=spreadsheet_id, body=body
             ).execute(),
             retries=3,
-            retryable=(HttpError,),
+            retryable=(HttpError, OSError),
             label="sheet_write",
         )
-    except HttpError:
+    except (HttpError, OSError):
         logger.info("FATAL stage=sheet_write error=SHEET_WRITE_FAILED")
         raise
 
@@ -214,7 +234,7 @@ def normalize_code(raw: str) -> Optional[str]:
 
 def yf_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": USER_AGENT})
+    s.headers.update({"User-Agent": random.choice(USER_AGENTS)})
     return s
 
 
@@ -322,19 +342,29 @@ def fetch_price_metrics(
     benchmark_returns: pd.Series,
     price_date: str,
     session: requests.Session,
+    close_bulk: Optional[pd.Series] = None,
 ) -> PriceMetrics:
-    hist = with_retry(
-        lambda: yf.Ticker(symbol).history(
-            period=PRICE_PERIOD, interval="1d", auto_adjust=True, repair=True
-        ),
-        retries=2,
-        retryable=(Exception,),
-        label="price_fetch",
-    )
-    if hist is None or hist.empty or "Close" not in hist.columns:
-        return PriceMetrics(None, None, None, None, 0)
+    """
+    close_bulk: D案で事前一括取得した Close Series（symbol→値）。
+    渡された場合はHTTPを呼ばずにそのまま使う。
+    None の場合は従来通り個別取得（フォールバック）。
+    """
+    if close_bulk is not None:
+        close_raw = close_bulk
+    else:
+        hist = with_retry(
+            lambda: yf.Ticker(symbol).history(
+                period=PRICE_PERIOD, interval="1d", auto_adjust=True, repair=True
+            ),
+            retries=2,
+            retryable=(Exception,),
+            label="price_fetch",
+        )
+        if hist is None or hist.empty or "Close" not in hist.columns:
+            return PriceMetrics(None, None, None, None, 0)
+        close_raw = hist["Close"]
 
-    close = pd.to_numeric(_squeeze_to_series(hist["Close"]), errors="coerce").dropna()
+    close = pd.to_numeric(_squeeze_to_series(close_raw), errors="coerce").dropna()
     close = close[close.index.strftime("%Y-%m-%d") <= price_date]
     if close.empty:
         return PriceMetrics(None, None, None, None, 0)
@@ -458,6 +488,54 @@ def fetch_financial_metrics(
         short_name=short_name,
     )
 
+def _col(raw: List[str], header: str) -> str:
+    """シートの生行から OUTPUT_HEADERS の列を取り出す。D列=index3 に対応。"""
+    idx = 3 + OUTPUT_HEADERS.index(header)
+    return str(raw[idx]).strip() if len(raw) > idx else ""
+
+
+def restore_cached_scores_from_sheet(raw: List[str]) -> Optional[Dict[str, Any]]:
+    """
+    E案: 前回シートのスコア・チェック・理由列をそのまま dict に復元する。
+    価格系（BETA, IVOL, PRICE_DATE）は毎日更新するのでここでは復元しない。
+    復元失敗（RUN_STATUS != OK、FINAL_CHECK が空）なら None を返す。
+    """
+    def _sf(header: str) -> Optional[float]:
+        return safe_float(_col(raw, header))
+
+    run_status = _col(raw, "RUN_STATUS")
+    if run_status != "OK":
+        return None
+
+    cached: Dict[str, Any] = {
+        "NAME_YF":         _col(raw, "NAME_YF"),
+        "SPEC_CHECK":      _col(raw, "SPEC_CHECK"),
+        "DD_CHECK":        _col(raw, "DD_CHECK"),
+        "DURATION_CHECK":  _col(raw, "DURATION_CHECK"),
+        "Q5_CHECK":        _col(raw, "Q5_CHECK"),
+        "FINAL_CHECK":     _col(raw, "FINAL_CHECK"),
+        "SPEC_SCORE":      _sf("SPEC_SCORE"),
+        "DD_SCORE":        _sf("DD_SCORE"),
+        "DURATION_SCORE":  _sf("DURATION_SCORE"),
+        "Q5_SCORE":        _sf("Q5_SCORE"),
+        "FINAL_SCORE":     _sf("FINAL_SCORE"),
+        "DD_RAW":          _sf("DD_RAW"),
+        "FCF_YIELD":       _sf("FCF_YIELD"),
+        "CFO_YIELD":       _sf("CFO_YIELD"),
+        "CAPEX_BURDEN":    _sf("CAPEX_BURDEN"),
+        "ASSET_GROWTH_1Y": _sf("ASSET_GROWTH_1Y"),
+        "ROE_TTM":         _sf("ROE_TTM"),
+        "DATA_COVERAGE":   int(_sf("DATA_COVERAGE") or 0),
+        "REASON_CODES":    _col(raw, "REASON_CODES"),
+        "REASON_TEXT":     _col(raw, "REASON_TEXT"),
+    }
+
+    # FINAL_CHECK が空 → 前回結果なし → 復元失敗
+    if not cached["FINAL_CHECK"]:
+        return None
+
+    return cached
+
 
 # ---------------------------------------------------------------------------
 # スコアリング
@@ -576,6 +654,11 @@ def main() -> None:
     service = get_sheets_service(cfg.credentials_info)
     spreadsheet_id = spreadsheet_id_from_url(cfg.spreadsheet_url)
 
+    # E案: JST 日曜日のみ財務データを更新する。それ以外の日は前回シート値を流用。
+    now_jst = datetime.now(JST)
+    is_fin_update_day = (now_jst.weekday() == 6)  # 6 = 日曜
+    logger.info(f"MODE fin_update={is_fin_update_day}")
+
     # 仕様 1-1: ensure_headers() は呼ばない
     # 仕様 7-1: fetch_sheet_rows 内で read 失敗を SHEET_READ_FAILED として出す
     rows_raw = fetch_sheet_rows(service, spreadsheet_id, cfg.worksheet_name)
@@ -609,15 +692,23 @@ def main() -> None:
             continue
 
         code = normalize_code(col_a)
-        # code が None = 無効コード行（PARSE_FAILED で埋める）
-        row_meta[sheet_row] = {"code": code, "skip": False, "raw": raw}
+        # E案: 財務更新日でない場合は前回シート値を復元してキャッシュとして持つ
+        cached_scores = None
+        if not is_fin_update_day and code is not None:
+            cached_scores = restore_cached_scores_from_sheet(raw)
+        row_meta[sheet_row] = {"code": code, "skip": False, "raw": raw, "cached_scores": cached_scores}
 
     # code → 対応するシート行番号のリスト（重複コード対応）
+    # E案: 同一コードの最初の行の cached_scores を代表値として使う
     code_to_rows: Dict[str, List[int]] = {}
+    code_cached_scores: Dict[str, Optional[Dict[str, Any]]] = {}
     for sheet_row, meta in row_meta.items():
         if meta.get("skip") or meta["code"] is None:
             continue
-        code_to_rows.setdefault(meta["code"], []).append(sheet_row)
+        c = meta["code"]
+        code_to_rows.setdefault(c, []).append(sheet_row)
+        if c not in code_cached_scores:
+            code_cached_scores[c] = meta.get("cached_scores")
 
     # ベンチマーク取得（失敗時は上位の例外ハンドラへ）
     session = yf_session()
@@ -628,12 +719,71 @@ def main() -> None:
     logger.info(f"READ unique_codes={len(code_to_rows)}")
 
     # ------------------------------------------------------------------
+    # D: yf.download で価格を一括取得し close_cache を構築する
+    # PRICE_BATCH_SIZE 件ずつ分割してリクエストする。
+    # 失敗したバッチはスキップし、該当銘柄は _fetch_one 内で個別取得にフォールバック。
+    # FETCH_WORKERS を下げても価格取得効率は落ちない（キャッシュ参照のみ）。
+    # ------------------------------------------------------------------
+    all_symbols = [f"{code}.T" for code in code_to_rows.keys()]
+    close_cache: Dict[str, pd.Series] = {}  # symbol → Close Series
+
+    for batch_start in range(0, len(all_symbols), PRICE_BATCH_SIZE):
+        batch = all_symbols[batch_start: batch_start + PRICE_BATCH_SIZE]
+        try:
+            bulk_df = with_retry(
+                lambda b=batch: yf.download(
+                    b,
+                    period=PRICE_PERIOD,
+                    interval="1d",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False,
+                ),
+                retries=2,
+                retryable=(Exception,),
+                label="price_bulk_fetch",
+            )
+            if bulk_df is None or bulk_df.empty:
+                continue
+
+            # Close 列を取り出す。単一銘柄でも複数銘柄でも同じ処理になるよう正規化する。
+            if "Close" in bulk_df.columns:
+                close_df = bulk_df["Close"]
+            else:
+                close_df = bulk_df.iloc[:, :len(batch)]
+
+            # close_df が Series（銘柄1件のとき）→ DataFrame に統一する
+            if isinstance(close_df, pd.Series):
+                close_df = close_df.to_frame(name=batch[0])
+
+            # MultiIndex の場合は1階層目（"Close"）を落として銘柄名だけにする
+            if isinstance(close_df.columns, pd.MultiIndex):
+                close_df.columns = close_df.columns.droplevel(0)
+
+            for sym in batch:
+                if sym in close_df.columns:
+                    s = close_df[sym].dropna()
+                    if not s.empty:
+                        close_cache[sym] = s
+
+        except Exception:
+            # バッチ失敗は致命的にしない。該当銘柄は個別取得へフォールバック。
+            logger.info(
+                f"PRICE_BULK batch_start={batch_start} size={len(batch)} failed, fallback to individual"
+            )
+
+    logger.info(f"PRICE_BULK cached={len(close_cache)} / {len(all_symbols)}")
+
+    # ------------------------------------------------------------------
     # 仕様 2-1: 同一コードは 1 回だけ計算する
+    # A: ThreadPoolExecutor で並列取得
+    # C: CHECKPOINT_EVERY 件ごとに途中書き込み
     # ------------------------------------------------------------------
     results: Dict[str, Dict[str, Any]] = {}
     codes = list(code_to_rows.keys())
 
-    for idx, code in enumerate(codes, start=1):
+    def _fetch_one(code: str) -> Dict[str, Any]:
+        """1銘柄分の取得処理。スレッドから呼ばれる。"""
         symbol = f"{code}.T"
         result: Dict[str, Any] = {
             "SYMBOL": symbol,
@@ -664,20 +814,55 @@ def main() -> None:
             "REASON_TEXT": "",
             "ERROR_MESSAGE": "",
         }
-
-        # 仕様 5-2: エラー種別を分類する
         try:
             try:
-                pm = fetch_price_metrics(symbol, benchmark_returns, benchmark_price_date, session)
+                pm = fetch_price_metrics(
+                    symbol,
+                    benchmark_returns,
+                    benchmark_price_date,
+                    session,
+                    close_bulk=close_cache.get(symbol),  # D: キャッシュあれば使う、なければ個別取得
+                )
             except Exception:
                 result["RUN_STATUS"] = "ERROR"
                 result["FINAL_CHECK"] = "ERROR"
                 result["ERROR_MESSAGE"] = "PRICE_FETCH_FAILED"
                 result["REASON_CODES"] = ["DATA_FETCH_ERROR"]
                 result["REASON_TEXT"] = reason_text("ERROR", ["DATA_FETCH_ERROR"], has_error=True)
-                results[code] = result
-                continue
+                return result
 
+            # E案: 財務更新日でない かつ 前回スコアが復元できる場合は財務取得をスキップする。
+            # 価格系（BETA, IVOL, PRICE_DATE）は毎日新しい値で上書きする。
+            cached = code_cached_scores.get(code)
+            if not is_fin_update_day and cached is not None:
+                result["PRICE_DATE"]    = pm.price_date or ""
+                result["BETA_252D"]     = pm.beta_252d
+                result["IVOL_252D"]     = pm.ivol_252d
+                result["NAME_YF"]       = cached["NAME_YF"]
+                result["SPEC_CHECK"]    = cached["SPEC_CHECK"]
+                result["DD_CHECK"]      = cached["DD_CHECK"]
+                result["DURATION_CHECK"]= cached["DURATION_CHECK"]
+                result["Q5_CHECK"]      = cached["Q5_CHECK"]
+                result["FINAL_CHECK"]   = cached["FINAL_CHECK"]
+                result["SPEC_SCORE"]    = cached["SPEC_SCORE"]
+                result["DD_SCORE"]      = cached["DD_SCORE"]
+                result["DURATION_SCORE"]= cached["DURATION_SCORE"]
+                result["Q5_SCORE"]      = cached["Q5_SCORE"]
+                result["FINAL_SCORE"]   = cached["FINAL_SCORE"]
+                result["DD_RAW"]        = cached["DD_RAW"]
+                result["FCF_YIELD"]     = cached["FCF_YIELD"]
+                result["CFO_YIELD"]     = cached["CFO_YIELD"]
+                result["CAPEX_BURDEN"]  = cached["CAPEX_BURDEN"]
+                result["ASSET_GROWTH_1Y"]= cached["ASSET_GROWTH_1Y"]
+                result["ROE_TTM"]       = cached["ROE_TTM"]
+                result["DATA_COVERAGE"] = cached["DATA_COVERAGE"]
+                result["REASON_CODES"]  = cached["REASON_CODES"]
+                result["REASON_TEXT"]   = cached["REASON_TEXT"]
+                # スコア再計算不要フラグ（後段の pct_score ループでスキップするために使う）
+                result["_use_cached_scores"] = True
+                return result
+
+            # 財務更新日 or 前回スコアなし → 通常通り財務取得
             try:
                 fm = fetch_financial_metrics(symbol, pm.latest_price, session)
             except Exception:
@@ -686,8 +871,7 @@ def main() -> None:
                 result["ERROR_MESSAGE"] = "FIN_FETCH_FAILED"
                 result["REASON_CODES"] = ["DATA_FETCH_ERROR"]
                 result["REASON_TEXT"] = reason_text("ERROR", ["DATA_FETCH_ERROR"], has_error=True)
-                results[code] = result
-                continue
+                return result
 
             result["PRICE_DATE"] = pm.price_date or ""
             result["BETA_252D"] = pm.beta_252d
@@ -754,12 +938,47 @@ def main() -> None:
             result["REASON_CODES"] = ["DATA_FETCH_ERROR"]
             result["REASON_TEXT"] = reason_text("ERROR", ["DATA_FETCH_ERROR"], has_error=True)
 
-        results[code] = result
+        return result
 
-        if idx % 500 == 0 or idx == len(codes):
-            ok_n = sum(1 for r in results.values() if r["RUN_STATUS"] == "OK")
-            err_n = sum(1 for r in results.values() if r["RUN_STATUS"] == "ERROR")
-            logger.info(f"PROGRESS done={idx} ok={ok_n} error={err_n}")
+    def _flush_checkpoint(done_codes: List[str]) -> None:
+        """C: 処理済みコードをシートに途中書き込みする。"""
+        partial_outputs: List[Tuple[int, List[Any]]] = []
+        for sheet_row, meta in row_meta.items():
+            if meta.get("skip"):
+                partial_outputs.append((sheet_row, [""] * len(OUTPUT_HEADERS)))
+                continue
+            c = meta["code"]
+            if c is None or c not in done_codes:
+                continue
+            r = results[c]
+            partial_outputs.append((sheet_row, _render_output_row(r)))
+        if partial_outputs:
+            try:
+                batch_write_output(service, spreadsheet_id, cfg.worksheet_name, partial_outputs)
+                logger.info(f"CHECKPOINT written={len(partial_outputs)}")
+            except Exception:
+                # チェックポイント失敗は致命的にしない（続行）
+                logger.info("CHECKPOINT write failed, continuing")
+
+    completed_codes: List[str] = []
+    last_checkpoint_count = 0
+
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
+        future_to_code = {executor.submit(_fetch_one, code): code for code in codes}
+        for idx, future in enumerate(as_completed(future_to_code), start=1):
+            code = future_to_code[future]
+            results[code] = future.result()
+            completed_codes.append(code)
+
+            if idx % 500 == 0 or idx == len(codes):
+                ok_n = sum(1 for r in results.values() if r["RUN_STATUS"] == "OK")
+                err_n = sum(1 for r in results.values() if r["RUN_STATUS"] == "ERROR")
+                logger.info(f"PROGRESS done={idx} ok={ok_n} error={err_n}")
+
+            # C: CHECKPOINT_EVERY 件ごとに途中書き込み
+            if idx - last_checkpoint_count >= CHECKPOINT_EVERY:
+                _flush_checkpoint(completed_codes)
+                last_checkpoint_count = idx
 
     # ------------------------------------------------------------------
     # パーセンタイルスコア計算（RUN_STATUS=OK のみ）
@@ -777,6 +996,9 @@ def main() -> None:
 
     for code, r in results.items():
         if r["RUN_STATUS"] != "OK":
+            continue
+        # E案: 財務キャッシュ流用の銘柄はスコア再計算をスキップする
+        if r.get("_use_cached_scores"):
             continue
 
         # --- SPEC ---
@@ -907,6 +1129,9 @@ def main() -> None:
 
     for code, r in results.items():
         if r["RUN_STATUS"] != "OK":
+            continue
+        # E案: 財務キャッシュ流用の銘柄はスコア再計算をスキップする
+        if r.get("_use_cached_scores"):
             continue
 
         # SPEC
