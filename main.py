@@ -506,7 +506,6 @@ def restore_cached_scores_from_sheet(raw: List[str]) -> Optional[Dict[str, Any]]
         return None
 
     cached: Dict[str, Any] = {
-        "NAME_YF":         _col(raw, "NAME_YF"),
         "SPEC_CHECK":      _col(raw, "SPEC_CHECK"),
         "DD_CHECK":        _col(raw, "DD_CHECK"),
         "DURATION_CHECK":  _col(raw, "DURATION_CHECK"),
@@ -784,7 +783,6 @@ def main() -> None:
         symbol = f"{code}.T"
         result: Dict[str, Any] = {
             "SYMBOL": symbol,
-            "NAME_YF": "",
             "RUN_STATUS": "OK",
             "UPDATED_AT_JST": datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S"),
             "PRICE_DATE": "",
@@ -835,7 +833,6 @@ def main() -> None:
                 result["PRICE_DATE"]    = pm.price_date or ""
                 result["BETA_252D"]     = pm.beta_252d
                 result["IVOL_252D"]     = pm.ivol_252d
-                result["NAME_YF"]       = cached["NAME_YF"]
                 result["SPEC_CHECK"]    = cached["SPEC_CHECK"]
                 result["DD_CHECK"]      = cached["DD_CHECK"]
                 result["DURATION_CHECK"]= cached["DURATION_CHECK"]
@@ -873,7 +870,6 @@ def main() -> None:
             result["PRICE_DATE"] = pm.price_date or ""
             result["BETA_252D"] = pm.beta_252d
             result["IVOL_252D"] = pm.ivol_252d
-            result["NAME_YF"] = fm.short_name
 
             price_ok = pm.price_days >= MIN_PRICE_DAYS and pm.price_date == benchmark_price_date
 
