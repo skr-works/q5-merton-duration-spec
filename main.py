@@ -47,34 +47,32 @@ CHECKPOINT_EVERY = 75    # 何件ごとに途中書き込みするか
 PRICE_BATCH_SIZE = 200   # yf.download 一括取得の銘柄数上限
 
 # 出力列定義（D列以降、固定）
+# SYMBOL / NAME_YF / PRICE_DATE は処理内部で使うが人間には不要なため出力しない
 OUTPUT_HEADERS = [
-    "SYMBOL",            # D
-    "NAME_YF",           # E
-    "RUN_STATUS",        # F
-    "UPDATED_AT_JST",    # G
-    "PRICE_DATE",        # H
-    "SPEC_CHECK",        # I
-    "DD_CHECK",          # J
-    "DURATION_CHECK",    # K
-    "Q5_CHECK",          # L
-    "FINAL_CHECK",       # M
-    "SPEC_SCORE",        # N
-    "DD_SCORE",          # O
-    "DURATION_SCORE",    # P
-    "Q5_SCORE",          # Q
-    "FINAL_SCORE",       # R
-    "BETA_252D",         # S
-    "IVOL_252D",         # T
-    "DD_RAW",            # U
-    "FCF_YIELD",         # V
-    "CFO_YIELD",         # W
-    "CAPEX_BURDEN",      # X
-    "ASSET_GROWTH_1Y",   # Y
-    "ROE_TTM",           # Z
-    "DATA_COVERAGE",     # AA
-    "REASON_CODES",      # AB
-    "REASON_TEXT",       # AC
-    "ERROR_MESSAGE",     # AD
+    "RUN_STATUS",        # D
+    "SPEC_CHECK",        # E
+    "DD_CHECK",          # F
+    "DURATION_CHECK",    # G
+    "Q5_CHECK",          # H
+    "FINAL_CHECK",       # I
+    "SPEC_SCORE",        # J
+    "DD_SCORE",          # K
+    "DURATION_SCORE",    # L
+    "Q5_SCORE",          # M
+    "FINAL_SCORE",       # N
+    "BETA_252D",         # O
+    "IVOL_252D",         # P
+    "DD_RAW",            # Q
+    "FCF_YIELD",         # R
+    "CFO_YIELD",         # S
+    "CAPEX_BURDEN",      # T
+    "ASSET_GROWTH_1Y",   # U
+    "ROE_TTM",           # V
+    "DATA_COVERAGE",     # W
+    "REASON_CODES",      # X
+    "REASON_TEXT",       # Y
+    "ERROR_MESSAGE",     # Z
+    "UPDATED_AT_JST",    # AA
 ]
 
 logger = logging.getLogger("screening")
@@ -585,9 +583,9 @@ def reason_text(final_check: str, reason_codes: List[str], has_error: bool) -> s
     """仕様 8-2 の優先順位に従う。"""
     if has_error:
         return "取得エラーで未判定"
-    if final_check == "PASS":
+    if final_check in {"AA", "A", "B", "C"}:
         return "全ゲート通過、総合評価上位"
-    if final_check == "WATCH":
+    if final_check == "D":
         return "安全条件は通過、総合評価は中位"
     if "DD_LOW" in reason_codes or "DD_HIGH_VOL" in reason_codes:
         return "信用リスクが高く見送り"
@@ -609,10 +607,9 @@ def _make_empty_output() -> Dict[str, Any]:
     return {h: "" for h in OUTPUT_HEADERS}
 
 
-def _make_error_output(symbol: str, error_message: str, reason_code: str) -> Dict[str, Any]:
+def _make_error_output(error_message: str, reason_code: str) -> Dict[str, Any]:
     """エラー行の出力 dict を生成する。REASON_TEXT も必ずセットする。"""
     out = _make_empty_output()
-    out["SYMBOL"] = symbol
     out["RUN_STATUS"] = "ERROR"
     out["UPDATED_AT_JST"] = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
     out["FINAL_CHECK"] = "ERROR"
@@ -1224,10 +1221,16 @@ def main() -> None:
             r["FINAL_SCORE"] = final_score
             if final_score is None:
                 r["FINAL_CHECK"] = "FAIL"
+            elif final_score >= 95:
+                r["FINAL_CHECK"] = "AA"
+            elif final_score >= 90:
+                r["FINAL_CHECK"] = "A"
+            elif final_score >= 80:
+                r["FINAL_CHECK"] = "B"
             elif final_score >= 70:
-                r["FINAL_CHECK"] = "PASS"
+                r["FINAL_CHECK"] = "C"
             elif final_score >= 50:
-                r["FINAL_CHECK"] = "WATCH"
+                r["FINAL_CHECK"] = "D"
             else:
                 r["FINAL_CHECK"] = "FAIL"
 
@@ -1255,9 +1258,7 @@ def main() -> None:
         code = meta["code"]
         if code is None:
             # 仕様 1-5: 無効コード行 → PARSE_FAILED
-            col_a = str(meta["raw"][0]).strip() if len(meta["raw"]) >= 1 else ""
-            symbol = f"{col_a}.T" if col_a else ""
-            out = _make_error_output(symbol, "PARSE_FAILED", "PARSE_ERROR")
+            out = _make_error_output("PARSE_FAILED", "PARSE_ERROR")
             row_outputs.append((sheet_row, _render_output_row(out)))
             continue
 
@@ -1275,30 +1276,28 @@ def main() -> None:
     else:
         logger.info("TOP_REASONS none=0")
 
-    pass_n = 0
-    watch_n = 0
-    fail_n = 0
-    error_n = 0
-    skipped_n = 0
+    grade_counter: Dict[str, int] = {"AA": 0, "A": 0, "B": 0, "C": 0, "D": 0, "FAIL": 0, "error": 0, "skipped": 0}
     for sheet_row, meta in row_meta.items():
         if meta.get("skip"):
-            skipped_n += 1
+            grade_counter["skipped"] += 1
             continue
         code = meta["code"]
         if code is None:
-            error_n += 1
+            grade_counter["error"] += 1
             continue
         fc = results[code]["FINAL_CHECK"]
         rs = results[code]["RUN_STATUS"]
         if rs == "ERROR":
-            error_n += 1
-        elif fc == "PASS":
-            pass_n += 1
-        elif fc == "WATCH":
-            watch_n += 1
+            grade_counter["error"] += 1
+        elif fc in grade_counter:
+            grade_counter[fc] += 1
         else:
-            fail_n += 1
-    logger.info(f"END pass={pass_n} watch={watch_n} fail={fail_n} error={error_n} skipped={skipped_n}")
+            grade_counter["FAIL"] += 1
+    logger.info(
+        f"END AA={grade_counter['AA']} A={grade_counter['A']} B={grade_counter['B']} "
+        f"C={grade_counter['C']} D={grade_counter['D']} FAIL={grade_counter['FAIL']} "
+        f"error={grade_counter['error']} skipped={grade_counter['skipped']}"
+    )
 
 
 if __name__ == "__main__":
