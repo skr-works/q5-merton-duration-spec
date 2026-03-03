@@ -42,8 +42,8 @@ USER_AGENTS = [
     # Edge / Windows
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
 ]
-FETCH_WORKERS = 15       # 並列スレッド数（レート制限に応じて調整）
-CHECKPOINT_EVERY = 75    # 何件ごとに途中書き込みするか
+FETCH_WORKERS = 5       # 並列スレッド数（レート制限に応じて調整）
+CHECKPOINT_EVERY = 50    # 何件ごとに途中書き込みするか
 PRICE_BATCH_SIZE = 200   # yf.download 一括取得の銘柄数上限
 
 # 出力列定義（D列以降、固定）
