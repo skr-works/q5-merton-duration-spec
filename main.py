@@ -49,30 +49,30 @@ PRICE_BATCH_SIZE = 200   # yf.download 一括取得の銘柄数上限
 # 出力列定義（D列以降、固定）
 # SYMBOL / NAME_YF / PRICE_DATE は処理内部で使うが人間には不要なため出力しない
 OUTPUT_HEADERS = [
-    "RUN_STATUS",        # D
-    "SPEC_CHECK",        # E
-    "DD_CHECK",          # F
-    "DURATION_CHECK",    # G
-    "Q5_CHECK",          # H
-    "FINAL_CHECK",       # I
-    "SPEC_SCORE",        # J
-    "DD_SCORE",          # K
-    "DURATION_SCORE",    # L
-    "Q5_SCORE",          # M
-    "FINAL_SCORE",       # N
-    "BETA_252D",         # O
-    "IVOL_252D",         # P
-    "DD_RAW",            # Q
-    "FCF_YIELD",         # R
-    "CFO_YIELD",         # S
-    "CAPEX_BURDEN",      # T
-    "ASSET_GROWTH_1Y",   # U
-    "ROE_TTM",           # V
-    "DATA_COVERAGE",     # W
-    "REASON_CODES",      # X
-    "REASON_TEXT",       # Y
-    "ERROR_MESSAGE",     # Z
-    "UPDATED_AT_JST",    # AA
+    "RUN_STATUS",        # D  / AB
+    "SPEC_CHECK",        # E  / AC
+    "DD_CHECK",          # F  / AD
+    "DURATION_CHECK",    # G  / AE
+    "Q5_CHECK",          # H  / AF
+    "FINAL_CHECK",       # I  / AG
+    "SPEC_SCORE",        # J  / AH
+    "DD_SCORE",          # K  / AI
+    "DURATION_SCORE",    # L  / AJ
+    "Q5_SCORE",          # M  / AK
+    "FINAL_SCORE",       # N  / AL
+    "BETA_252D",         # O  / AM
+    "IVOL_252D",         # P  / AN
+    "DD_RAW",            # Q  / AO
+    "FCF_YIELD",         # R  / AP
+    "CFO_YIELD",         # S  / AQ
+    "CAPEX_BURDEN",      # T  / AR
+    "ASSET_GROWTH_1Y",   # U  / AS
+    "ROE_TTM",           # V  / AT
+    "DATA_COVERAGE",     # W  / AU
+    "REASON_CODES",      # X  / AV
+    "REASON_TEXT",       # Y  / AW
+    "ERROR_MESSAGE",     # Z  / AX
+    "UPDATED_AT_JST",    # AA / AY
 ]
 
 logger = logging.getLogger("screening")
@@ -164,12 +164,12 @@ def with_retry(fn, retries: int, retryable=(Exception,), label: str = "operation
 
 def fetch_sheet_rows(service, spreadsheet_id: str, worksheet_name: str) -> List[List[str]]:
     """シート全体を読む。失敗時は SHEET_READ_FAILED をログして再 raise する。"""
-    range_name = f"{worksheet_name}!A:AD"
+    range_name = f"{worksheet_name}!A:AY"   # A:AD → A:AY に変更（DB領域AB〜AY列を含む）
     try:
         resp = with_retry(
             lambda: service.spreadsheets().values().get(
                 spreadsheetId=spreadsheet_id, range=range_name,
-                valueRenderOption="UNFORMATTED_VALUE"  # ← この1行を追加
+                valueRenderOption="UNFORMATTED_VALUE"
             ).execute(),
             retries=2,
             retryable=(HttpError, OSError),
@@ -191,14 +191,16 @@ def batch_write_output(
     D列以降のみを、元の行番号を保持して書き込む。
     row_outputs: [(sheet_row_number, output_values), ...]
       sheet_row_number : シートの実際の行番号（1始まり）
-      output_values    : OUTPUT_HEADERS 分（D〜AD）の値リスト
+      output_values    : OUTPUT_HEADERS 分の値を UI用・DB用それぞれ並べた48要素リスト
+                         前半24要素 → D〜AA列（UI領域）
+                         後半24要素 → AB〜AY列（DB領域・Python専用）
     A〜C列は一切触らない。失敗時は SHEET_WRITE_FAILED をログして再 raise する。
     """
     if not row_outputs:
         return
     data = []
     for sheet_row, values in row_outputs:
-        range_str = f"{worksheet_name}!D{sheet_row}:AD{sheet_row}"
+        range_str = f"{worksheet_name}!D{sheet_row}:AY{sheet_row}"   # D:AD → D:AY に変更
         data.append({"range": range_str, "values": [values]})
     body = {"valueInputOption": "RAW", "data": data}
     try:
@@ -487,9 +489,13 @@ def fetch_financial_metrics(
         short_name=short_name,
     )
 
+
 def _col(raw: List[str], header: str) -> str:
-    """シートの生行から OUTPUT_HEADERS の列を取り出す。D列=index3 に対応。"""
-    idx = 3 + OUTPUT_HEADERS.index(header)
+    """
+    DB保存領域（AB列〜AY列）から値を取り出す。
+    AB列 = index 27。UI領域（D〜AA列 = index 3〜26）は一切参照しない。
+    """
+    idx = 27 + OUTPUT_HEADERS.index(header)   # 3 → 27 に変更（AB列起点）
     return str(raw[idx]).strip() if len(raw) > idx else ""
 
 
@@ -498,6 +504,7 @@ def restore_cached_scores_from_sheet(raw: List[str]) -> Optional[Dict[str, Any]]
     E案: 前回シートのスコア・チェック・理由列をそのまま dict に復元する。
     価格系（BETA, IVOL, PRICE_DATE）は毎日更新するのでここでは復元しない。
     復元失敗（RUN_STATUS != OK、FINAL_CHECK が空）なら None を返す。
+    読み取りは必ず DB領域（AB列〜AY列）から行う。
     """
     def _sf(header: str) -> Optional[float]:
         return safe_float(_col(raw, header))
@@ -620,7 +627,12 @@ def _make_error_output(error_message: str, reason_code: str) -> Dict[str, Any]:
 
 
 def _render_output_row(result: Dict[str, Any]) -> List[Any]:
-    """result dict → OUTPUT_HEADERS 順の値リスト（D〜AD列に対応）。"""
+    """
+    result dict → OUTPUT_HEADERS 順の値リストを生成し、UI用とDB用を連結して返す。
+    前半24要素 → D〜AA列（UI領域・スプシ側で書式設定自由）
+    後半24要素 → AB〜AY列（DB領域・書式設定禁止・Python専用）
+    両者は完全に同一の値。合計48要素。
+    """
     row = []
     for h in OUTPUT_HEADERS:
         val = result.get(h, "")
@@ -638,7 +650,7 @@ def _render_output_row(result: Dict[str, Any]) -> List[Any]:
         elif val is None:
             val = ""
         row.append(val)
-    return row
+    return row + row   # UI用（D〜AA）とDB用（AB〜AY）を連結
 
 
 # ---------------------------------------------------------------------------
@@ -690,6 +702,7 @@ def main() -> None:
 
         code = normalize_code(col_a)
         # E案: 財務更新日でない場合は前回シート値を復元してキャッシュとして持つ
+        # 読み取りは必ず DB領域（AB列〜AY列）から行う
         cached_scores = None
         if not is_fin_update_day and code is not None:
             cached_scores = restore_cached_scores_from_sheet(raw)
@@ -939,7 +952,7 @@ def main() -> None:
         partial_outputs: List[Tuple[int, List[Any]]] = []
         for sheet_row, meta in row_meta.items():
             if meta.get("skip"):
-                partial_outputs.append((sheet_row, [""] * len(OUTPUT_HEADERS)))
+                partial_outputs.append((sheet_row, [""] * len(OUTPUT_HEADERS) * 2))
                 continue
             c = meta["code"]
             if c is None or c not in done_codes:
@@ -1247,9 +1260,9 @@ def main() -> None:
     row_outputs: List[Tuple[int, List[Any]]] = []
 
     for sheet_row, meta in row_meta.items():
-        # 完全空行・メモ行は D〜AD を空欄で上書きする（古い結果を残さない）
+        # 完全空行・メモ行は D〜AY を空欄で上書きする（古い結果を残さない）
         if meta.get("skip"):
-            row_outputs.append((sheet_row, [""] * len(OUTPUT_HEADERS)))
+            row_outputs.append((sheet_row, [""] * len(OUTPUT_HEADERS) * 2))
             continue
 
         code = meta["code"]
